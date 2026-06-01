@@ -1,0 +1,28 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Local build and test output.
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Runtime scratch space.
+.runtime/
+
+# Local Go backup snapshot. The durable backup is the git branch `golang`.
+golang_code/
+
+# Generated binaries and coverage output.
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.gcda
+*.gcno
+coverage/
