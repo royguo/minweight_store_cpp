@@ -7,7 +7,6 @@
 ```text
 ID       状态   优先级  任务
 -------  -----  ------  ------------------------------------------------------
-TODO-1   Open   P0      完成 minpatricia C++ 核心接口、node page 表示和 golden tests
 TODO-2   Open   P0      基于 minpatricia 实现 heap-backed in-memory KV store
 TODO-3   Open   P1      设计并实现 WAL record encoding、CRC 和 replay policy
 TODO-4   Open   P1      设计并实现 manifest append、compact 和 startup validation
@@ -20,11 +19,4 @@ TODO-9   Open   P2      重建 crash tests、recovery tests、fuzz tests 和 ben
 
 ## 当前执行建议
 
-下一步先推进 `TODO-1`。在 `src/minpatricia/` 内建立最小类型集合：
-
-- `Position`
-- `ByteView`
-- `RecordStore`
-- `NodeStore`
-- fixed 4 KiB `NodePage`
-- insert/delete/seek/scan 的行为测试
+下一步推进 `TODO-2`，基于已完成的 `minpatricia` 实现 heap-backed in-memory KV store。

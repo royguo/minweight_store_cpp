@@ -1,3 +1,2 @@
 add_subdirectory(minpatricia)
-add_subdirectory(runtime)
-add_subdirectory(storage)
+add_subdirectory(minweight_store)

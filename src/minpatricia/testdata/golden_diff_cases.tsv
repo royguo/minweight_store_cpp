@@ -1,0 +1,7 @@
+# a_hex b_hex status cmp diff
+41 4141 ok -1 9
+- 61 ok -1 0
+61 62 ok -1 7
+616263 616264 ok -1 24
+80 00 ok 1 1
+78 78 equal 0 0

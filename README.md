@@ -26,8 +26,7 @@
 |   `-- worklogs/
 |-- src/
 |   |-- minpatricia/
-|   |-- runtime/
-|   `-- storage/
+|   `-- minweight_store/
 `-- third/
 ```
 

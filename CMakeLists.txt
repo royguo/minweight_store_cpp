@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MINWEIGHT_BUILD_TESTS "Build minweight_store_cpp tests" ON)
+option(MINWEIGHT_BUILD_BENCHMARKS "Build minweight_store_cpp benchmarks" ON)
 
 include(CTest)
 

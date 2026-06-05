@@ -1,0 +1,10 @@
+# op key pos
+put delta 1
+put alpha 2
+put charlie 3
+put bravo 4
+put charlie 9
+delete alpha 2
+final bravo 4
+final charlie 9
+final delta 1
