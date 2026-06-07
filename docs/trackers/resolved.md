@@ -25,4 +25,7 @@ ID       类型      说明
 -------  --------  ------------------------------------------------------------
 TODO-3   Code      完成 minweight_store WAL record encoding、CRC、mmap append、rollover、point-in-time prefix replay 和 strict replay
 TODO-6   Code      建立 minweight_store Runtime 注入边界并提供 StdRuntime；主链路锁和 blocking I/O 入口可由 Runtime 替换
+STORE-1  Code      实现 C++ 单记录 MANIFEST、generation snapshot checkpoint、WAL generation 文件布局和旧 generation/snapshot GC
+STORE-2  Test      增加 Close checkpoint、snapshot+WAL tail replay、WAL prefix recovery 和 strict recovery 测试
+BUG-1    Code      修复 Delete 成功路径把 OK Status 隐式构造成 Result<bool>{false} 的返回值问题
 ```

@@ -11,6 +11,8 @@ enum class StatusCode {
   kClosed,
   kWalFull,
   kCorruptWal,
+  kCorruptManifest,
+  kCorruptSnapshot,
   kCorruptIndex,
   kIoError,
   kRuntimeError,

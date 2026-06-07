@@ -37,8 +37,13 @@ constexpr std::uint64_t kRecordFileNoLimit = 1ULL << (63 - kRecordOffsetBits);
 constexpr std::uint64_t kWalHeaderSize = 4096;
 constexpr std::uint32_t kWalVersion = 1;
 constexpr std::uint64_t kFirstWalSegmentNo = 1;
+constexpr std::uint64_t kFirstWalGeneration = 1;
 constexpr const char* kWalDirName = "wal";
 constexpr const char* kWalSegmentSuffix = ".wal";
+constexpr const char* kManifestName = "MANIFEST";
+constexpr const char* kSnapshotName = "SNAPSHOT";
+constexpr const char* kTmpSuffix = ".tmp";
+constexpr std::size_t kCheckpointWalSegmentThreshold = 4;
 
 constexpr std::size_t kWalHeaderVersionOffset = 8;
 constexpr std::size_t kWalHeaderUsedOffset = 16;
@@ -53,6 +58,10 @@ constexpr std::uint8_t kWalOpPut = 1;
 constexpr std::uint8_t kWalOpDelete = 2;
 
 constexpr std::array<char, 8> kWalHeaderMagic{{'M', 'W', 'W', 'A', 'L', '0', '1', 0}};
+constexpr std::array<char, 8> kManifestMagic{{'M', 'W', 'M', 'A', 'N', '0', '1', 0}};
+constexpr std::array<char, 8> kSnapshotMagic{{'M', 'W', 'S', 'N', 'A', 'P', '1', 0}};
+constexpr std::uint32_t kManifestVersion = 1;
+constexpr std::uint32_t kSnapshotVersion = 1;
 
 Status IoError(const std::string& op, const std::string& path) {
   return Status(StatusCode::kIoError,
@@ -61,6 +70,14 @@ Status IoError(const std::string& op, const std::string& path) {
 
 Status CorruptWal(const std::string& message) {
   return Status(StatusCode::kCorruptWal, message);
+}
+
+Status CorruptManifest(const std::string& message) {
+  return Status(StatusCode::kCorruptManifest, message);
+}
+
+Status CorruptSnapshot(const std::string& message) {
+  return Status(StatusCode::kCorruptSnapshot, message);
 }
 
 Status FromMinpatriciaStatus(minpatricia::Status status) {
@@ -162,6 +179,10 @@ std::uint32_t WalRecordCRC(minpatricia::ByteView record) {
   return crc;
 }
 
+std::uint32_t BytesCRC(minpatricia::ByteView value) {
+  return CRC32Update(0, value.data(), value.size());
+}
+
 Result<minpatricia::Position> MakeRecordPosition(std::uint64_t file_no,
                                                   std::uint64_t offset) {
   if (file_no == 0 || file_no >= kRecordFileNoLimit || offset >= kRecordOffsetLimit) {
@@ -190,6 +211,58 @@ std::string JoinPath(const std::string& lhs, const std::string& rhs) {
     return lhs + rhs;
   }
   return lhs + "/" + rhs;
+}
+
+Status WriteAll(int fd, const std::byte* data, std::size_t size,
+                const std::string& path) {
+  std::size_t written = 0;
+  while (written < size) {
+    const ssize_t n = ::write(fd, data + written, size - written);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return IoError("write", path);
+    }
+    if (n == 0) {
+      return Status(StatusCode::kIoError, "short write " + path);
+    }
+    written += static_cast<std::size_t>(n);
+  }
+  return OkStatus();
+}
+
+Status ReadAll(int fd, std::byte* data, std::size_t size, const std::string& path) {
+  std::size_t read_bytes = 0;
+  while (read_bytes < size) {
+    const ssize_t n = ::read(fd, data + read_bytes, size - read_bytes);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return IoError("read", path);
+    }
+    if (n == 0) {
+      return Status(StatusCode::kIoError, "short read " + path);
+    }
+    read_bytes += static_cast<std::size_t>(n);
+  }
+  return OkStatus();
+}
+
+Status SyncDir(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    return IoError("open_dir", path);
+  }
+  Status status;
+  if (::fsync(fd) != 0) {
+    status = IoError("fsync_dir", path);
+  }
+  if (::close(fd) != 0 && status.ok()) {
+    status = IoError("close_dir", path);
+  }
+  return status;
 }
 
 Status CreateDirIfMissing(const std::string& path) {
@@ -238,6 +311,24 @@ std::string WalSegmentName(std::uint64_t file_no) {
   std::ostringstream out;
   out << std::setw(20) << std::setfill('0') << file_no << kWalSegmentSuffix;
   return out.str();
+}
+
+std::string FixedWidthID(std::uint64_t id) {
+  std::ostringstream out;
+  out << std::setw(20) << std::setfill('0') << id;
+  return out.str();
+}
+
+std::string WalGenerationName(std::uint64_t generation) {
+  return FixedWidthID(generation);
+}
+
+std::string SnapshotFileName(std::uint64_t generation) {
+  return std::string(kSnapshotName) + "." + FixedWidthID(generation);
+}
+
+std::string SnapshotPath(const std::string& dir, std::uint64_t generation) {
+  return JoinPath(dir, SnapshotFileName(generation));
 }
 
 Result<std::uint64_t> ParseWalSegmentName(const std::string& name) {
@@ -291,12 +382,420 @@ Result<std::vector<std::uint64_t>> ListWalSegmentIDs(const std::string& wal_dir)
   return ids;
 }
 
+Result<std::vector<std::uint64_t>> ListWalGenerations(const std::string& wal_root) {
+  DIR* dir = ::opendir(wal_root.c_str());
+  if (dir == nullptr) {
+    if (errno == ENOENT) {
+      return std::vector<std::uint64_t>{};
+    }
+    return IoError("opendir", wal_root);
+  }
+
+  std::vector<std::uint64_t> generations;
+  for (;;) {
+    errno = 0;
+    dirent* entry = ::readdir(dir);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        Status status = IoError("readdir", wal_root);
+        ::closedir(dir);
+        return status;
+      }
+      break;
+    }
+    const std::string name(entry->d_name);
+    if (name == "." || name == ".." || name.size() != 20) {
+      continue;
+    }
+    bool digits = true;
+    std::uint64_t value = 0;
+    for (char c : name) {
+      if (c < '0' || c > '9') {
+        digits = false;
+        break;
+      }
+      value = value * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    if (digits && value > 0) {
+      generations.push_back(value);
+    }
+  }
+  if (::closedir(dir) != 0) {
+    return IoError("closedir", wal_root);
+  }
+  std::sort(generations.begin(), generations.end());
+  return generations;
+}
+
+Result<std::uint64_t> ParseSnapshotFileName(const std::string& name) {
+  const std::string prefix = std::string(kSnapshotName) + ".";
+  if (name.size() != prefix.size() + 20 ||
+      name.compare(0, prefix.size(), prefix) != 0) {
+    return Status(StatusCode::kInvalidArgument, "not a snapshot file");
+  }
+  std::uint64_t value = 0;
+  for (std::size_t i = prefix.size(); i < name.size(); ++i) {
+    if (name[i] < '0' || name[i] > '9') {
+      return Status(StatusCode::kInvalidArgument, "not a snapshot file");
+    }
+    value = value * 10 + static_cast<std::uint64_t>(name[i] - '0');
+  }
+  if (value == 0) {
+    return Status(StatusCode::kInvalidArgument, "invalid snapshot generation");
+  }
+  return value;
+}
+
+Result<std::vector<std::uint64_t>> ListSnapshotGenerations(const std::string& dir_path) {
+  DIR* dir = ::opendir(dir_path.c_str());
+  if (dir == nullptr) {
+    if (errno == ENOENT) {
+      return std::vector<std::uint64_t>{};
+    }
+    return IoError("opendir", dir_path);
+  }
+
+  std::vector<std::uint64_t> generations;
+  for (;;) {
+    errno = 0;
+    dirent* entry = ::readdir(dir);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        Status status = IoError("readdir", dir_path);
+        ::closedir(dir);
+        return status;
+      }
+      break;
+    }
+    auto generation = ParseSnapshotFileName(entry->d_name);
+    if (generation.ok()) {
+      generations.push_back(generation.value());
+    }
+  }
+  if (::closedir(dir) != 0) {
+    return IoError("closedir", dir_path);
+  }
+  std::sort(generations.begin(), generations.end());
+  return generations;
+}
+
+Status RemoveTree(const std::string& path) {
+  DIR* dir = ::opendir(path.c_str());
+  if (dir == nullptr) {
+    if (errno == ENOENT) {
+      return OkStatus();
+    }
+    if (::unlink(path.c_str()) == 0 || errno == ENOENT) {
+      return OkStatus();
+    }
+    return IoError("remove", path);
+  }
+
+  Status first;
+  for (;;) {
+    errno = 0;
+    dirent* entry = ::readdir(dir);
+    if (entry == nullptr) {
+      if (errno != 0 && first.ok()) {
+        first = IoError("readdir", path);
+      }
+      break;
+    }
+    const std::string name(entry->d_name);
+    if (name == "." || name == "..") {
+      continue;
+    }
+    Status status = RemoveTree(JoinPath(path, name));
+    if (!status.ok() && first.ok()) {
+      first = status;
+    }
+  }
+  if (::closedir(dir) != 0 && first.ok()) {
+    first = IoError("closedir", path);
+  }
+  if (::rmdir(path.c_str()) != 0 && errno != ENOENT && first.ok()) {
+    first = IoError("rmdir", path);
+  }
+  return first;
+}
+
+Status RemoveOldWalGenerations(const std::string& dir, std::uint64_t keep_generation) {
+  const std::string wal_root = JoinPath(dir, kWalDirName);
+  auto generations = ListWalGenerations(wal_root);
+  if (!generations.ok()) {
+    return generations.status();
+  }
+  Status first;
+  for (std::uint64_t generation : generations.value()) {
+    if (generation == keep_generation) {
+      continue;
+    }
+    Status status = RemoveTree(JoinPath(wal_root, WalGenerationName(generation)));
+    if (!status.ok() && first.ok()) {
+      first = status;
+    }
+  }
+  return first;
+}
+
+Status RemoveOldSnapshots(const std::string& dir, std::uint64_t keep_generation) {
+  auto generations = ListSnapshotGenerations(dir);
+  if (!generations.ok()) {
+    return generations.status();
+  }
+  Status first;
+  for (std::uint64_t generation : generations.value()) {
+    if (generation == keep_generation) {
+      continue;
+    }
+    const std::string path = SnapshotPath(dir, generation);
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT && first.ok()) {
+      first = IoError("unlink", path);
+    }
+  }
+  return first;
+}
+
 struct WalRecord {
   std::uint8_t op = 0;
   minpatricia::ByteView key;
   minpatricia::ByteView value;
   std::uint64_t end = 0;
 };
+
+struct ManifestState {
+  bool valid = false;
+  std::uint64_t wal_generation = kFirstWalGeneration;
+};
+
+std::string ManifestPath(const std::string& dir) {
+  return JoinPath(dir, kManifestName);
+}
+
+Result<ManifestState> ReadManifest(const std::string& dir) {
+  const std::string path = ManifestPath(dir);
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      return ManifestState{};
+    }
+    return IoError("open", path);
+  }
+
+  std::array<std::byte, 32> data{};
+  Status status = ReadAll(fd, data.data(), data.size(), path);
+  if (::close(fd) != 0 && status.ok()) {
+    status = IoError("close", path);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (std::memcmp(data.data(), kManifestMagic.data(), kManifestMagic.size()) != 0) {
+    return CorruptManifest("invalid manifest magic");
+  }
+  if (Load32(data.data() + 8) != kManifestVersion) {
+    return CorruptManifest("unsupported manifest version");
+  }
+  const std::uint64_t wal_generation = Load64(data.data() + 16);
+  if (wal_generation == 0) {
+    return CorruptManifest("invalid WAL generation");
+  }
+  const std::uint32_t want = Load32(data.data() + 28);
+  Store32(data.data() + 28, 0);
+  const std::uint32_t got = BytesCRC(minpatricia::ByteView(data.data(), data.size()));
+  if (got != want) {
+    return CorruptManifest("manifest CRC mismatch");
+  }
+  return ManifestState{true, wal_generation};
+}
+
+Status WriteManifest(const std::string& dir, std::uint64_t wal_generation) {
+  if (wal_generation == 0) {
+    return CorruptManifest("invalid WAL generation");
+  }
+
+  std::array<std::byte, 32> data{};
+  std::memcpy(data.data(), kManifestMagic.data(), kManifestMagic.size());
+  Store32(data.data() + 8, kManifestVersion);
+  Store64(data.data() + 16, wal_generation);
+  Store32(data.data() + 28, 0);
+  Store32(data.data() + 28, BytesCRC(minpatricia::ByteView(data.data(), data.size())));
+
+  const std::string path = ManifestPath(dir);
+  const std::string tmp = path + kTmpSuffix;
+  const int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+  if (fd < 0) {
+    return IoError("open", tmp);
+  }
+  Status status = WriteAll(fd, data.data(), data.size(), tmp);
+  if (status.ok() && ::fsync(fd) != 0) {
+    status = IoError("fsync", tmp);
+  }
+  if (::close(fd) != 0 && status.ok()) {
+    status = IoError("close", tmp);
+  }
+  if (!status.ok()) {
+    (void)::unlink(tmp.c_str());
+    return status;
+  }
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    (void)::unlink(tmp.c_str());
+    return IoError("rename", path);
+  }
+  return SyncDir(dir);
+}
+
+Status WriteSnapshot(const std::string& dir, std::uint64_t generation,
+                     const std::vector<Item>& entries) {
+  if (generation == 0) {
+    return CorruptSnapshot("invalid snapshot generation");
+  }
+  const std::string path = SnapshotPath(dir, generation);
+  const std::string tmp = path + kTmpSuffix;
+  const int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+  if (fd < 0) {
+    return IoError("open", tmp);
+  }
+
+  std::array<std::byte, 32> header{};
+  std::memcpy(header.data(), kSnapshotMagic.data(), kSnapshotMagic.size());
+  Store32(header.data() + 8, kSnapshotVersion);
+  Store64(header.data() + 16, static_cast<std::uint64_t>(entries.size()));
+  Store64(header.data() + 24, generation);
+  Status status = WriteAll(fd, header.data(), header.size(), tmp);
+
+  for (const Item& item : entries) {
+    if (!status.ok()) {
+      break;
+    }
+    if (item.key.size() > std::numeric_limits<std::uint32_t>::max() ||
+        item.value.size() > std::numeric_limits<std::uint32_t>::max()) {
+      status = CorruptSnapshot("snapshot item is too large");
+      break;
+    }
+    std::array<std::byte, 12> record_header{};
+    Store32(record_header.data(), static_cast<std::uint32_t>(item.key.size()));
+    Store32(record_header.data() + 4, static_cast<std::uint32_t>(item.value.size()));
+    std::uint32_t crc = CRC32Update(0, record_header.data(), 8);
+    crc = CRC32Update(crc, reinterpret_cast<const std::byte*>(item.key.data()),
+                      item.key.size());
+    crc = CRC32Update(crc, reinterpret_cast<const std::byte*>(item.value.data()),
+                      item.value.size());
+    Store32(record_header.data() + 8, crc);
+    status = WriteAll(fd, record_header.data(), record_header.size(), tmp);
+    if (status.ok()) {
+      status = WriteAll(fd, reinterpret_cast<const std::byte*>(item.key.data()),
+                        item.key.size(), tmp);
+    }
+    if (status.ok()) {
+      status = WriteAll(fd, reinterpret_cast<const std::byte*>(item.value.data()),
+                        item.value.size(), tmp);
+    }
+  }
+
+  if (status.ok() && ::fsync(fd) != 0) {
+    status = IoError("fsync", tmp);
+  }
+  if (::close(fd) != 0 && status.ok()) {
+    status = IoError("close", tmp);
+  }
+  if (!status.ok()) {
+    (void)::unlink(tmp.c_str());
+    return status;
+  }
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    (void)::unlink(tmp.c_str());
+    return IoError("rename", path);
+  }
+  return SyncDir(dir);
+}
+
+Result<std::vector<Item>> ReadSnapshot(const std::string& dir, std::uint64_t generation) {
+  if (generation == 0) {
+    return CorruptSnapshot("invalid snapshot generation");
+  }
+  const std::string path = SnapshotPath(dir, generation);
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      return CorruptSnapshot("snapshot missing for manifest generation");
+    }
+    return IoError("open", path);
+  }
+
+  std::array<std::byte, 32> header{};
+  Status status = ReadAll(fd, header.data(), header.size(), path);
+  if (!status.ok()) {
+    (void)::close(fd);
+    return status;
+  }
+  if (std::memcmp(header.data(), kSnapshotMagic.data(), kSnapshotMagic.size()) != 0) {
+    (void)::close(fd);
+    return CorruptSnapshot("invalid snapshot magic");
+  }
+  if (Load32(header.data() + 8) != kSnapshotVersion) {
+    (void)::close(fd);
+    return CorruptSnapshot("unsupported snapshot version");
+  }
+  const std::uint64_t count = Load64(header.data() + 16);
+  const std::uint64_t snapshot_generation = Load64(header.data() + 24);
+  if (snapshot_generation != generation) {
+    (void)::close(fd);
+    return CorruptSnapshot("snapshot generation mismatch");
+  }
+  if (count > static_cast<std::uint64_t>(kRecordOffsetLimit - 1)) {
+    (void)::close(fd);
+    return CorruptSnapshot("snapshot has too many records");
+  }
+
+  std::vector<Item> entries;
+  entries.reserve(static_cast<std::size_t>(count));
+  for (std::uint64_t i = 0; i < count; ++i) {
+    std::array<std::byte, 12> record_header{};
+    status = ReadAll(fd, record_header.data(), record_header.size(), path);
+    if (!status.ok()) {
+      (void)::close(fd);
+      return status;
+    }
+    const std::uint32_t key_size = Load32(record_header.data());
+    const std::uint32_t value_size = Load32(record_header.data() + 4);
+    const std::uint32_t want_crc = Load32(record_header.data() + 8);
+    if (key_size > minpatricia::kMaxKeySize) {
+      (void)::close(fd);
+      return CorruptSnapshot("snapshot key is too large");
+    }
+    Item item;
+    item.key.resize(key_size);
+    item.value.resize(value_size);
+    if (key_size != 0) {
+      status = ReadAll(fd, reinterpret_cast<std::byte*>(&item.key[0]), key_size, path);
+    }
+    if (status.ok() && value_size != 0) {
+      status = ReadAll(fd, reinterpret_cast<std::byte*>(&item.value[0]), value_size, path);
+    }
+    if (!status.ok()) {
+      (void)::close(fd);
+      return status;
+    }
+    Store32(record_header.data() + 8, 0);
+    std::uint32_t crc = CRC32Update(0, record_header.data(), 8);
+    crc = CRC32Update(crc, reinterpret_cast<const std::byte*>(item.key.data()),
+                      item.key.size());
+    crc = CRC32Update(crc, reinterpret_cast<const std::byte*>(item.value.data()),
+                      item.value.size());
+    if (crc != want_crc) {
+      (void)::close(fd);
+      return CorruptSnapshot("snapshot record CRC mismatch");
+    }
+    entries.push_back(std::move(item));
+  }
+
+  if (::close(fd) != 0) {
+    return IoError("close", path);
+  }
+  return entries;
+}
 
 class WalSegment {
  public:
@@ -587,17 +1086,21 @@ class WalSegment {
 class SegmentedRecordStore {
  public:
   static Result<std::unique_ptr<SegmentedRecordStore>> Open(const std::string& dir,
-                                                            std::uint64_t wal_size) {
+                                                            std::uint64_t wal_size,
+                                                            std::uint64_t generation) {
     if (wal_size < kWalHeaderSize + kWalRecordHeaderSize ||
         wal_size > kRecordOffsetLimit) {
       return Status(StatusCode::kInvalidArgument, "invalid WAL segment size");
     }
-    Status status = CreateDirs(JoinPath(dir, kWalDirName));
+    if (generation == 0) {
+      return CorruptManifest("invalid WAL generation");
+    }
+    Status status = CreateDirs(WalGenerationPath(dir, generation));
     if (!status.ok()) {
       return status;
     }
 
-    auto ids = ListWalSegmentIDs(JoinPath(dir, kWalDirName));
+    auto ids = ListWalSegmentIDs(WalGenerationPath(dir, generation));
     if (!ids.ok()) {
       return ids.status();
     }
@@ -608,8 +1111,10 @@ class SegmentedRecordStore {
     auto store = std::unique_ptr<SegmentedRecordStore>(new SegmentedRecordStore());
     store->dir_ = dir;
     store->wal_size_ = wal_size;
+    store->generation_ = generation;
     store->active_file_no_ = ids.value().back();
     store->next_file_no_ = store->active_file_no_ + 1;
+    store->snapshot_records_.push_back(OwnedRecord{});
 
     for (const std::uint64_t id : ids.value()) {
       auto segment = WalSegment::Open(store->WalPath(id), wal_size, id);
@@ -647,7 +1152,26 @@ class SegmentedRecordStore {
     return Active()->Append(kWalOpDelete, key, minpatricia::ByteView{});
   }
 
+  Result<minpatricia::Position> AddSnapshotRecord(minpatricia::ByteView key,
+                                                  minpatricia::ByteView value) {
+    if (snapshot_records_.size() >= kRecordOffsetLimit) {
+      return CorruptSnapshot("too many snapshot records");
+    }
+    const minpatricia::Position pos =
+        static_cast<minpatricia::Position>(snapshot_records_.size());
+    snapshot_records_.push_back(OwnedRecord{minpatricia::CopyBytes(key),
+                                            minpatricia::CopyBytes(value), true});
+    return pos;
+  }
+
   minpatricia::Result<minpatricia::ByteView> Key(minpatricia::Position pos) {
+    if (IsSnapshotPosition(pos)) {
+      const auto* record = SnapshotRecord(pos);
+      if (record == nullptr) {
+        return minpatricia::Status(minpatricia::StatusCode::kMissingKey);
+      }
+      return minpatricia::ByteView(record->key);
+    }
     WalSegment* segment = Segment(RecordPositionFileNo(pos));
     if (segment == nullptr) {
       return minpatricia::Status(minpatricia::StatusCode::kMissingKey);
@@ -660,6 +1184,13 @@ class SegmentedRecordStore {
   }
 
   Result<minpatricia::ByteView> ValueView(minpatricia::Position pos) {
+    if (IsSnapshotPosition(pos)) {
+      const auto* record = SnapshotRecord(pos);
+      if (record == nullptr) {
+        return Status(StatusCode::kCorruptIndex, "snapshot record not found");
+      }
+      return minpatricia::ByteView(record->value);
+    }
     WalSegment* segment = Segment(RecordPositionFileNo(pos));
     if (segment == nullptr) {
       return Status(StatusCode::kCorruptIndex, "record segment not found");
@@ -692,9 +1223,10 @@ class SegmentedRecordStore {
     std::sort(ids.begin(), ids.end());
 
     bool drop_remaining = false;
+    std::uint64_t last_kept_file_no = active_file_no_;
     for (std::uint64_t id : ids) {
       if (drop_remaining) {
-        remove(WalPath(id).c_str());
+        (void)::unlink(WalPath(id).c_str());
         segments_.erase(id);
         continue;
       }
@@ -722,8 +1254,16 @@ class SegmentedRecordStore {
       if (!status.ok()) {
         return status;
       }
+      last_kept_file_no = id;
       if (truncated) {
         drop_remaining = true;
+      }
+    }
+    if (drop_remaining) {
+      active_file_no_ = last_kept_file_no;
+      next_file_no_ = active_file_no_ + 1;
+      for (auto& entry : segments_) {
+        entry.second->set_sealed(entry.first != active_file_no_);
       }
     }
     return OkStatus();
@@ -740,6 +1280,9 @@ class SegmentedRecordStore {
     return first;
   }
 
+  [[nodiscard]] std::uint64_t generation() const { return generation_; }
+  [[nodiscard]] std::size_t SegmentCount() const { return segments_.size(); }
+
   Status Close(bool sync) {
     Status first;
     for (auto& entry : segments_) {
@@ -752,8 +1295,61 @@ class SegmentedRecordStore {
     return first;
   }
 
+  Status ResetToSnapshot(std::uint64_t generation) {
+    if (generation == 0) {
+      return CorruptManifest("invalid WAL generation");
+    }
+    Status first = Close(false);
+    if (!first.ok()) {
+      return first;
+    }
+    Status status = CreateDirs(WalGenerationPath(dir_, generation));
+    if (!status.ok()) {
+      return status;
+    }
+    snapshot_records_.clear();
+    snapshot_records_.push_back(OwnedRecord{});
+    generation_ = generation;
+    active_file_no_ = kFirstWalSegmentNo;
+    next_file_no_ = kFirstWalSegmentNo + 1;
+    auto segment = WalSegment::Open(WalPath(kFirstWalSegmentNo), wal_size_,
+                                    kFirstWalSegmentNo);
+    if (!segment.ok()) {
+      return segment.status();
+    }
+    segment.value()->set_sealed(false);
+    segments_.emplace(kFirstWalSegmentNo, segment.take_value());
+    return OkStatus();
+  }
+
  private:
+  struct OwnedRecord {
+    std::vector<std::byte> key;
+    std::vector<std::byte> value;
+    bool live = false;
+  };
+
   SegmentedRecordStore() = default;
+
+  static std::string WalGenerationPath(const std::string& dir, std::uint64_t generation) {
+    return JoinPath(JoinPath(dir, kWalDirName), WalGenerationName(generation));
+  }
+
+  static bool IsSnapshotPosition(minpatricia::Position pos) {
+    return pos > 0 && static_cast<std::uint64_t>(pos) < kRecordOffsetLimit;
+  }
+
+  const OwnedRecord* SnapshotRecord(minpatricia::Position pos) const {
+    const std::uint64_t index = static_cast<std::uint64_t>(pos);
+    if (index == 0 || index >= snapshot_records_.size()) {
+      return nullptr;
+    }
+    const auto& record = snapshot_records_[static_cast<std::size_t>(index)];
+    if (!record.live) {
+      return nullptr;
+    }
+    return &record;
+  }
 
   WalSegment* Segment(std::uint64_t file_no) {
     auto it = segments_.find(file_no);
@@ -785,13 +1381,15 @@ class SegmentedRecordStore {
   }
 
   std::string WalPath(std::uint64_t id) const {
-    return JoinPath(JoinPath(dir_, kWalDirName), WalSegmentName(id));
+    return JoinPath(WalGenerationPath(dir_, generation_), WalSegmentName(id));
   }
 
   std::string dir_;
   std::uint64_t wal_size_ = 0;
+  std::uint64_t generation_ = kFirstWalGeneration;
   std::uint64_t active_file_no_ = 0;
   std::uint64_t next_file_no_ = 0;
+  std::vector<OwnedRecord> snapshot_records_;
   std::unordered_map<std::uint64_t, std::unique_ptr<WalSegment>> segments_;
 };
 
@@ -857,7 +1455,13 @@ class Store::Impl {
       return status;
     }
 
-    auto records = SegmentedRecordStore::Open(dir, options.wal_size);
+    auto manifest = ReadManifest(dir);
+    if (!manifest.ok()) {
+      return manifest.status();
+    }
+
+    auto records = SegmentedRecordStore::Open(dir, options.wal_size,
+                                              manifest.value().wal_generation);
     if (!records.ok()) {
       return records.status();
     }
@@ -867,13 +1471,39 @@ class Store::Impl {
       return FromMinpatriciaStatus(index.status());
     }
 
+    if (manifest.value().valid) {
+      auto snapshot = ReadSnapshot(dir, manifest.value().wal_generation);
+      if (!snapshot.ok()) {
+        return snapshot.status();
+      }
+      status = LoadSnapshotRecords(records.value().get(), &index.value(), snapshot.value());
+      if (!status.ok()) {
+        return status;
+      }
+    }
+
     status = records.value()->ReplayAll(options.wal_replay_policy, &index.value());
     if (!status.ok()) {
       return status;
     }
+    if (manifest.value().valid) {
+      status = options.runtime->BlockingIO("cleanup_old_checkpoints", [&] {
+        Status wal = RemoveOldWalGenerations(dir, manifest.value().wal_generation);
+        Status snapshot = RemoveOldSnapshots(dir, manifest.value().wal_generation);
+        if (!wal.ok()) {
+          return wal;
+        }
+        return snapshot;
+      });
+      if (!status.ok()) {
+        return status;
+      }
+    }
 
     auto impl = std::unique_ptr<Impl>(new Impl());
     impl->runtime_ = options.runtime;
+    impl->dir_ = dir;
+    impl->wal_size_ = options.wal_size;
     impl->primary_mu_ = impl->runtime_->NewRWMutex();
     impl->records_ = records.take_value();
     impl->nodes_ = std::move(nodes);
@@ -888,7 +1518,8 @@ class Store::Impl {
     if (options.runtime == nullptr) {
       options.runtime = StdRuntime::Shared();
     }
-    auto records = SegmentedRecordStore::Open(InMemoryTempPath(), options.wal_size);
+    const std::string dir = InMemoryTempPath();
+    auto records = SegmentedRecordStore::Open(dir, options.wal_size, kFirstWalGeneration);
     if (!records.ok()) {
       return records.status();
     }
@@ -899,6 +1530,8 @@ class Store::Impl {
     }
     auto impl = std::unique_ptr<Impl>(new Impl());
     impl->runtime_ = options.runtime;
+    impl->dir_ = dir;
+    impl->wal_size_ = options.wal_size;
     impl->primary_mu_ = impl->runtime_->NewRWMutex();
     impl->records_ = records.take_value();
     impl->nodes_ = std::move(nodes);
@@ -912,10 +1545,14 @@ class Store::Impl {
   Status Close() {
     std::unique_ptr<SegmentedRecordStore> records;
     bool sync_on_close = false;
+    Status checkpoint_status;
     {
       WriteLock lock(*primary_mu_);
       if (!open_) {
         return OkStatus();
+      }
+      if (sync_on_close_) {
+        checkpoint_status = CheckpointLocked();
       }
       open_ = false;
       sync_on_close = sync_on_close_;
@@ -927,7 +1564,11 @@ class Store::Impl {
       return OkStatus();
     }
     return runtime_->BlockingIO("close_store", [&] {
-      return records->Close(sync_on_close);
+      Status close_status = records->Close(sync_on_close);
+      if (!checkpoint_status.ok()) {
+        return checkpoint_status;
+      }
+      return close_status;
     });
   }
 
@@ -957,7 +1598,7 @@ class Store::Impl {
     if (!put.ok()) {
       return MarkFatal(FromMinpatriciaStatus(put.status()));
     }
-    return OkStatus();
+    return CheckpointIfNeededLocked();
   }
 
   Result<GetResult> Get(ByteView key) {
@@ -1000,16 +1641,24 @@ class Store::Impl {
     if (key.size() > minpatricia::kMaxKeySize) {
       return Status(StatusCode::kInvalidArgument, "key too large");
     }
-    auto tombstone = records_->DeleteRecord(key);
-    if (!tombstone.ok()) {
-      return tombstone.status();
-    }
     auto deleted = index_->Delete(key);
     if (!deleted.ok()) {
       return MarkFatal(FromMinpatriciaStatus(deleted.status()));
     }
     if (!deleted.value().deleted || deleted.value().pos != pos.value().pos) {
       return MarkFatal(Status(StatusCode::kCorruptIndex, "delete position mismatch"));
+    }
+    auto tombstone = records_->DeleteRecord(key);
+    if (!tombstone.ok()) {
+      auto restore = index_->Put(key, pos.value().pos);
+      if (!restore.ok()) {
+        return MarkFatal(FromMinpatriciaStatus(restore.status()));
+      }
+      return tombstone.status();
+    }
+    status = CheckpointIfNeededLocked();
+    if (!status.ok()) {
+      return status;
     }
     return true;
   }
@@ -1126,6 +1775,110 @@ class Store::Impl {
     return out.str();
   }
 
+  static Status LoadSnapshotRecords(SegmentedRecordStore* records, Index* index,
+                                    const std::vector<Item>& entries) {
+    for (const Item& item : entries) {
+      auto pos = records->AddSnapshotRecord(minpatricia::AsBytes(item.key),
+                                            minpatricia::AsBytes(item.value));
+      if (!pos.ok()) {
+        return pos.status();
+      }
+      auto put = index->Put(minpatricia::AsBytes(item.key), pos.value());
+      if (!put.ok()) {
+        return FromMinpatriciaStatus(put.status());
+      }
+    }
+    return OkStatus();
+  }
+
+  Result<std::vector<Item>> CollectLiveItemsLocked() {
+    std::vector<Item> entries;
+    entries.reserve(static_cast<std::size_t>(index_->Len()));
+    Status visit_status;
+    auto status = index_->Ascend([&](minpatricia::ByteView key,
+                                     minpatricia::Position pos) {
+      auto item = MakeItem(key, pos);
+      if (!item.ok()) {
+        visit_status = item.status();
+        return false;
+      }
+      entries.push_back(item.take_value());
+      return true;
+    });
+    if (!visit_status.ok()) {
+      return visit_status;
+    }
+    if (!status.ok()) {
+      return FromMinpatriciaStatus(status);
+    }
+    return entries;
+  }
+
+  Status RebuildIndexFromSnapshotLocked(const std::vector<Item>& entries) {
+    auto nodes = std::unique_ptr<minpatricia::HeapNodeStore>(new minpatricia::HeapNodeStore());
+    auto index = Index::NewWithNodes(*records_, *nodes);
+    if (!index.ok()) {
+      return FromMinpatriciaStatus(index.status());
+    }
+    Status status = LoadSnapshotRecords(records_.get(), &index.value(), entries);
+    if (!status.ok()) {
+      return status;
+    }
+    nodes_ = std::move(nodes);
+    index_.reset(new Index(index.take_value()));
+    return OkStatus();
+  }
+
+  Status CheckpointIfNeededLocked() {
+    if (records_->SegmentCount() <= kCheckpointWalSegmentThreshold) {
+      return OkStatus();
+    }
+    return CheckpointLocked();
+  }
+
+  Status CheckpointLocked() {
+    auto entries = CollectLiveItemsLocked();
+    if (!entries.ok()) {
+      return entries.status();
+    }
+    const std::uint64_t next_generation = records_->generation() + 1;
+    Status status = runtime_->BlockingIO("write_checkpoint", [&] {
+      Status snapshot = WriteSnapshot(dir_, next_generation, entries.value());
+      if (!snapshot.ok()) {
+        return snapshot;
+      }
+      Status dirs = CreateDirs(JoinPath(JoinPath(dir_, kWalDirName),
+                                        WalGenerationName(next_generation)));
+      if (!dirs.ok()) {
+        return dirs;
+      }
+      Status manifest = WriteManifest(dir_, next_generation);
+      if (!manifest.ok()) {
+        return manifest;
+      }
+      return OkStatus();
+    });
+    if (!status.ok()) {
+      return status;
+    }
+    status = records_->ResetToSnapshot(next_generation);
+    if (!status.ok()) {
+      return status;
+    }
+    status = RebuildIndexFromSnapshotLocked(entries.value());
+    if (!status.ok()) {
+      return status;
+    }
+    return runtime_->BlockingIO("cleanup_checkpoint", [&] {
+      Status wal = RemoveOldWalGenerations(dir_, next_generation);
+      Status snapshot = RemoveOldSnapshots(dir_, next_generation);
+      if (!wal.ok()) {
+        return wal;
+      }
+      return snapshot;
+    });
+  }
+
   Status CheckOpen() const {
     if (!open_ || records_ == nullptr || index_ == nullptr) {
       return Status(StatusCode::kClosed, "store is closed");
@@ -1198,6 +1951,8 @@ class Store::Impl {
   }
 
   std::shared_ptr<Runtime> runtime_;
+  std::string dir_;
+  std::uint64_t wal_size_ = 0;
   std::unique_ptr<RWMutex> primary_mu_;
   std::unique_ptr<SegmentedRecordStore> records_;
   std::unique_ptr<minpatricia::HeapNodeStore> nodes_;
