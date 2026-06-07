@@ -14,14 +14,18 @@
 
 namespace minpatricia {
 
-template <RecordStoreLike RecordStore>
+template <class RecordStore>
 struct IndexWithOwnedNodes {
+  static_assert(IsRecordStoreLike<RecordStore>::value,
+                "RecordStore must provide Result<ByteView> Key(Position)");
   std::unique_ptr<HeapNodeStore> nodes;
   Index<RecordStore, HeapNodeStore> index;
 };
 
-template <RecordStoreLike RecordStore>
+template <class RecordStore>
 Result<IndexWithOwnedNodes<RecordStore>> NewWithRecords(RecordStore& records) {
+  static_assert(IsRecordStoreLike<RecordStore>::value,
+                "RecordStore must provide Result<ByteView> Key(Position)");
   auto nodes = std::make_unique<HeapNodeStore>();
   auto index = Index<RecordStore, HeapNodeStore>::NewWithNodes(records, *nodes);
   if (!index.ok()) {

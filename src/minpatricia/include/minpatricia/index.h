@@ -2,11 +2,10 @@
 
 #include <algorithm>
 #include <array>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -46,8 +45,8 @@ struct RebuildScratch {
 };
 
 struct Cartesian {
-  std::span<int> left;
-  std::span<int> right;
+  Span<int> left;
+  Span<int> right;
   int root = 0;
 };
 
@@ -139,9 +138,14 @@ inline int AbsInt(int value) {
 
 }  // namespace detail
 
-template <RecordStoreLike RecordStore, NodeStoreLike NodeStore = HeapNodeStore>
+template <class RecordStore, class NodeStore = HeapNodeStore>
 class Index {
  public:
+  static_assert(IsRecordStoreLike<RecordStore>::value,
+                "RecordStore must provide Result<ByteView> Key(Position)");
+  static_assert(IsNodeStoreLike<NodeStore>::value,
+                "NodeStore must provide Root/Get/Alloc/Free/LiveNodes with minpatricia types");
+
   Index() = default;
 
   static Result<Index> NewWithNodes(RecordStore& records, NodeStore& nodes) {
@@ -445,14 +449,14 @@ class Index {
       return OkStatus();
     }
 
-    auto diffs = BuildDiffs(std::span<const Rep>(node->reps.data(), static_cast<std::size_t>(size)));
+    auto diffs = BuildDiffs(Span<const Rep>(node->reps.data(), static_cast<std::size_t>(size)));
     if (!diffs.ok()) {
       return diffs.status();
     }
     return RebuildRoutesWithDiffs(node, diffs.value());
   }
 
-  Status RebuildNodeWithDiffs(NodePage* node, std::span<const std::uint16_t> diffs) {
+  Status RebuildNodeWithDiffs(NodePage* node, Span<const std::uint16_t> diffs) {
     const int size = static_cast<int>(node->size);
     if (size == 0) {
       if (!diffs.empty()) {
@@ -485,11 +489,11 @@ class Index {
     return RebuildRoutesWithDiffs(node, diffs);
   }
 
-  Status RebuildRoutesWithDiffs(NodePage* node, std::span<const std::uint16_t> diffs) {
+  Status RebuildRoutesWithDiffs(NodePage* node, Span<const std::uint16_t> diffs) {
     const int size = static_cast<int>(node->size);
     auto cartesian = BuildCartesian(diffs);
     WritePreorderRoutes(
-        std::span<Route>(node->routes.data(), diffs.size()), diffs, cartesian.left,
+        Span<Route>(node->routes.data(), diffs.size()), diffs, cartesian.left,
         cartesian.right, cartesian.root, size);
     for (std::size_t i = diffs.size(); i < node->routes.size(); ++i) {
       node->routes[i] = Route{};
@@ -497,10 +501,10 @@ class Index {
     return OkStatus();
   }
 
-  Result<std::span<std::uint16_t>> BuildDiffs(std::span<const Rep> reps) {
+  Result<Span<std::uint16_t>> BuildDiffs(Span<const Rep> reps) {
     if (reps.size() < 2) {
       scratch_.diffs.clear();
-      return std::span<std::uint16_t>{};
+      return Span<std::uint16_t>{};
     }
     const std::size_t diff_count = reps.size() - 1;
     scratch_.diffs.resize(diff_count);
@@ -511,7 +515,7 @@ class Index {
       }
       scratch_.diffs[i] = diff.value();
     }
-    return std::span<std::uint16_t>(scratch_.diffs.data(), scratch_.diffs.size());
+    return Span<std::uint16_t>(scratch_.diffs.data(), scratch_.diffs.size());
   }
 
   Result<std::uint16_t> DiffBetweenReps(Rep left, Rep right) {
@@ -579,7 +583,7 @@ class Index {
     return child.value()->last_pos;
   }
 
-  detail::Cartesian BuildCartesian(std::span<const std::uint16_t> diffs) {
+  detail::Cartesian BuildCartesian(Span<const std::uint16_t> diffs) {
     const int n = static_cast<int>(diffs.size());
     scratch_.left.assign(static_cast<std::size_t>(n), -1);
     scratch_.right.assign(static_cast<std::size_t>(n), -1);
@@ -605,12 +609,12 @@ class Index {
     const int root = scratch_.cart_stack.front();
     scratch_.cart_stack.clear();
     return detail::Cartesian{
-        std::span<int>(scratch_.left.data(), scratch_.left.size()),
-        std::span<int>(scratch_.right.data(), scratch_.right.size()), root};
+        Span<int>(scratch_.left.data(), scratch_.left.size()),
+        Span<int>(scratch_.right.data(), scratch_.right.size()), root};
   }
 
-  void WritePreorderRoutes(std::span<Route> out, std::span<const std::uint16_t> diffs,
-                           std::span<const int> left, std::span<const int> right, int root,
+  void WritePreorderRoutes(Span<Route> out, Span<const std::uint16_t> diffs,
+                           Span<const int> left, Span<const int> right, int root,
                            int size) {
     scratch_.route_stack.clear();
     scratch_.route_stack.reserve(static_cast<std::size_t>(size));
@@ -723,7 +727,7 @@ class Index {
     }
   }
 
-  Result<detail::InsertSlot> InsertSlotFromPath(std::span<const PutFrame> frames, ByteView key,
+  Result<detail::InsertSlot> InsertSlotFromPath(Span<const PutFrame> frames, ByteView key,
                                                 int cmp, std::uint16_t diff) {
     for (int i = 0; i < static_cast<int>(frames.size()); ++i) {
       auto node = NodeByID(frames[static_cast<std::size_t>(i)].id);
@@ -747,7 +751,7 @@ class Index {
     return detail::InsertSlot{static_cast<int>(frames.size()) - 1, last.leaf + 1};
   }
 
-  Status InsertAtPath(std::span<const PutFrame> frames, int target, int slot, Rep new_rep,
+  Status InsertAtPath(Span<const PutFrame> frames, int target, int slot, Rep new_rep,
                       ByteView key, std::uint16_t diff) {
     const std::uint64_t target_id = frames[static_cast<std::size_t>(target)].id;
     auto node_result = NodeByID(target_id);
@@ -775,7 +779,7 @@ class Index {
     for (int i = slot; i < size; ++i) {
       buf[static_cast<std::size_t>(i + 1)] = node->reps[static_cast<std::size_t>(i)];
     }
-    const auto reps = std::span<const Rep>(buf.data(), static_cast<std::size_t>(size + 1));
+    const auto reps = Span<const Rep>(buf.data(), static_cast<std::size_t>(size + 1));
 
     if (target > 0) {
       const PutFrame& parent_frame = frames[static_cast<std::size_t>(target - 1)];
@@ -880,7 +884,7 @@ class Index {
     return SplitAndWriteNode(id, std::move(reps));
   }
 
-  Result<int> PathEdgeInsertSlot(std::span<const PutFrame> frames, int target, int slot,
+  Result<int> PathEdgeInsertSlot(Span<const PutFrame> frames, int target, int slot,
                                  int old_size) {
     if (slot != 0 && slot != old_size) {
       return -1;
@@ -903,7 +907,7 @@ class Index {
     return slot;
   }
 
-  Status PropagateBoundary(std::span<const PutFrame> frames, int changed, Position old_first,
+  Status PropagateBoundary(Span<const PutFrame> frames, int changed, Position old_first,
                            Position old_last) {
     auto child_result = NodeByID(frames[static_cast<std::size_t>(changed)].id);
     if (!child_result.ok()) {
@@ -953,7 +957,7 @@ class Index {
   }
 
   Status PromoteSibling(std::uint64_t parent_id, int child_slot, std::uint64_t child_id,
-                        std::span<const Rep> reps) {
+                        Span<const Rep> reps) {
     if (reps.size() != kMaxNodeReps + 1) {
       return Status(StatusCode::kCorruptLayout);
     }
@@ -1017,14 +1021,14 @@ class Index {
 
     std::array<std::uint16_t, kMaxNodeReps - 1> old_diff_buf{};
     auto old_diffs =
-        std::span<std::uint16_t>(old_diff_buf.data(), static_cast<std::size_t>(parent_size - 1));
+        Span<std::uint16_t>(old_diff_buf.data(), static_cast<std::size_t>(parent_size - 1));
     if (const Status status = parent->RouteDiffs(old_diffs); !status.ok()) {
       return status;
     }
 
     std::array<std::uint16_t, kMaxNodeReps - 1> new_diff_buf{};
     auto new_diffs =
-        std::span<std::uint16_t>(new_diff_buf.data(), static_cast<std::size_t>(parent_size));
+        Span<std::uint16_t>(new_diff_buf.data(), static_cast<std::size_t>(parent_size));
     for (int i = 0; i < child_slot; ++i) {
       new_diffs[static_cast<std::size_t>(i)] = old_diffs[static_cast<std::size_t>(i)];
     }
@@ -1034,13 +1038,13 @@ class Index {
     }
 
     return WriteNodeWithDiffs(parent_id,
-                              std::span<const Rep>(parent_reps.data(),
+                              Span<const Rep>(parent_reps.data(),
                                                    static_cast<std::size_t>(parent_size + 1)),
                               new_diffs);
   }
 
-  Status WriteNodeWithDiffs(std::uint64_t id, std::span<const Rep> reps,
-                            std::span<const std::uint16_t> diffs) {
+  Status WriteNodeWithDiffs(std::uint64_t id, Span<const Rep> reps,
+                            Span<const std::uint16_t> diffs) {
     if (reps.size() > kMaxNodeReps) {
       return Status(StatusCode::kCorruptLayout);
     }
@@ -1065,7 +1069,7 @@ class Index {
     return RebuildNodeWithDiffs(node, diffs);
   }
 
-  Status WriteNode(std::uint64_t id, std::span<const Rep> reps) {
+  Status WriteNode(std::uint64_t id, Span<const Rep> reps) {
     if (reps.size() > kMaxNodeReps) {
       return SplitAndWriteNode(id, std::vector<Rep>(reps.begin(), reps.end()));
     }
@@ -1089,7 +1093,7 @@ class Index {
 
   Status SplitAndWriteNodeAt(std::uint64_t id, std::vector<Rep> reps, int insert_slot) {
     while (reps.size() > kMaxNodeReps) {
-      auto range = ChooseSplitRange(std::span<const Rep>(reps.data(), reps.size()), insert_slot);
+      auto range = ChooseSplitRange(Span<const Rep>(reps.data(), reps.size()), insert_slot);
       if (!range.ok()) {
         return range.status();
       }
@@ -1105,7 +1109,7 @@ class Index {
       std::vector<Rep> child_reps(reps.begin() + start, reps.begin() + end);
       if (const Status status =
               WriteNode(child_id,
-                        std::span<const Rep>(child_reps.data(), child_reps.size()));
+                        Span<const Rep>(child_reps.data(), child_reps.size()));
           !status.ok()) {
         return status;
       }
@@ -1121,7 +1125,7 @@ class Index {
       reps.erase(reps.begin() + start + 1, reps.begin() + end);
       insert_slot = RemapInsertSlotAfterSplit(insert_slot, start, end, count);
     }
-    return WriteNode(id, std::span<const Rep>(reps.data(), reps.size()));
+    return WriteNode(id, Span<const Rep>(reps.data(), reps.size()));
   }
 
   static int RemapInsertSlotAfterSplit(int slot, int start, int end, int count) {
@@ -1137,7 +1141,7 @@ class Index {
     return slot - count + 1;
   }
 
-  Result<detail::SplitRange> ChooseSplitRange(std::span<const Rep> reps, int insert_slot) {
+  Result<detail::SplitRange> ChooseSplitRange(Span<const Rep> reps, int insert_slot) {
     if (reps.size() < 4) {
       return Status(StatusCode::kCorruptLayout);
     }
@@ -1211,7 +1215,7 @@ class Index {
     return detail::SplitRange{best_start, best_count};
   }
 
-  Result<detail::SplitRange> ChooseEdgeSplitRange(std::span<const std::uint16_t> diffs,
+  Result<detail::SplitRange> ChooseEdgeSplitRange(Span<const std::uint16_t> diffs,
                                                   int rep_count, int insert_slot) {
     auto cartesian = BuildCartesian(diffs);
     int best_start = -1;
@@ -1422,7 +1426,7 @@ class Index {
     const int new_size = parent_size - 1 + child_size;
 
     std::array<std::uint16_t, kMaxNodeReps - 1> old_parent_diff_buf{};
-    auto old_parent_diffs = std::span<std::uint16_t>(
+    auto old_parent_diffs = Span<std::uint16_t>(
         old_parent_diff_buf.data(), static_cast<std::size_t>(parent_size - 1));
     if (const Status status = node->RouteDiffs(old_parent_diffs); !status.ok()) {
       return status;
@@ -1430,7 +1434,7 @@ class Index {
 
     std::array<std::uint16_t, kMaxNodeReps - 1> new_diff_buf{};
     auto new_diffs =
-        std::span<std::uint16_t>(new_diff_buf.data(), static_cast<std::size_t>(new_size - 1));
+        Span<std::uint16_t>(new_diff_buf.data(), static_cast<std::size_t>(new_size - 1));
     for (int i = 0; i < slot; ++i) {
       new_diffs[static_cast<std::size_t>(i)] =
           old_parent_diffs[static_cast<std::size_t>(i)];
@@ -1536,7 +1540,7 @@ class Index {
     const int child_size = static_cast<int>(child->size);
     std::array<Rep, kMaxNodeReps> rep_buf{};
     auto reps =
-        std::span<Rep>(rep_buf.data(), static_cast<std::size_t>(left_size + child_size));
+        Span<Rep>(rep_buf.data(), static_cast<std::size_t>(left_size + child_size));
     for (int i = 0; i < left_size; ++i) {
       reps[static_cast<std::size_t>(i)] = left->reps[static_cast<std::size_t>(i)];
     }
@@ -1546,7 +1550,7 @@ class Index {
     }
 
     std::array<std::uint16_t, kMaxNodeReps - 1> old_parent_diff_buf{};
-    auto old_parent_diffs = std::span<std::uint16_t>(
+    auto old_parent_diffs = Span<std::uint16_t>(
         old_parent_diff_buf.data(), static_cast<std::size_t>(parent_size - 1));
     if (const Status status = node->RouteDiffs(old_parent_diffs); !status.ok()) {
       return status;
@@ -1554,7 +1558,7 @@ class Index {
 
     std::array<std::uint16_t, kMaxNodeReps - 1> diff_buf{};
     auto diffs =
-        std::span<std::uint16_t>(diff_buf.data(), static_cast<std::size_t>(reps.size() - 1));
+        Span<std::uint16_t>(diff_buf.data(), static_cast<std::size_t>(reps.size() - 1));
     if (left_size > 1) {
       if (const Status status =
               left->RouteDiffs(diffs.subspan(0, static_cast<std::size_t>(left_size - 1)));
@@ -1588,7 +1592,7 @@ class Index {
     const int right_size = static_cast<int>(right->size);
     std::array<Rep, kMaxNodeReps> rep_buf{};
     auto reps =
-        std::span<Rep>(rep_buf.data(), static_cast<std::size_t>(child_size + right_size));
+        Span<Rep>(rep_buf.data(), static_cast<std::size_t>(child_size + right_size));
     for (int i = 0; i < child_size; ++i) {
       reps[static_cast<std::size_t>(i)] = child->reps[static_cast<std::size_t>(i)];
     }
@@ -1598,7 +1602,7 @@ class Index {
     }
 
     std::array<std::uint16_t, kMaxNodeReps - 1> old_parent_diff_buf{};
-    auto old_parent_diffs = std::span<std::uint16_t>(
+    auto old_parent_diffs = Span<std::uint16_t>(
         old_parent_diff_buf.data(), static_cast<std::size_t>(parent_size - 1));
     if (const Status status = node->RouteDiffs(old_parent_diffs); !status.ok()) {
       return status;
@@ -1606,7 +1610,7 @@ class Index {
 
     std::array<std::uint16_t, kMaxNodeReps - 1> diff_buf{};
     auto diffs =
-        std::span<std::uint16_t>(diff_buf.data(), static_cast<std::size_t>(reps.size() - 1));
+        Span<std::uint16_t>(diff_buf.data(), static_cast<std::size_t>(reps.size() - 1));
     if (child_size > 1) {
       if (const Status status =
               child->RouteDiffs(diffs.subspan(0, static_cast<std::size_t>(child_size - 1)));
@@ -1641,13 +1645,13 @@ class Index {
 
     std::array<std::uint16_t, kMaxNodeReps - 1> old_diff_buf{};
     auto old_diffs =
-        std::span<std::uint16_t>(old_diff_buf.data(), static_cast<std::size_t>(size - 1));
+        Span<std::uint16_t>(old_diff_buf.data(), static_cast<std::size_t>(size - 1));
     if (const Status status = node->RouteDiffs(old_diffs); !status.ok()) {
       return status;
     }
     std::array<std::uint16_t, kMaxNodeReps - 1> new_diff_buf{};
     auto new_diffs =
-        std::span<std::uint16_t>(new_diff_buf.data(), static_cast<std::size_t>(size - 2));
+        Span<std::uint16_t>(new_diff_buf.data(), static_cast<std::size_t>(size - 2));
     for (int i = 0; i < drop_diff; ++i) {
       new_diffs[static_cast<std::size_t>(i)] = old_diffs[static_cast<std::size_t>(i)];
     }

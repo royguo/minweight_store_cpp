@@ -7,7 +7,7 @@ github.com/JimChengLin/minpatricia
 commit 2d1ddf70ce818228302912b81220b634218176b4
 ```
 
-本文档记录 Go 版 `*_test.go` 的测试/benchmark 在 C++20 版中的对应覆盖点。
+本文档记录 Go 版 `*_test.go` 的测试/benchmark 在 C++17 版中的对应覆盖点。
 
 ## index_test.go
 

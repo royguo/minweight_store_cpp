@@ -1,8 +1,8 @@
 #pragma once
 
-#include <concepts>
 #include <cstddef>
 #include <functional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -30,10 +30,15 @@ class RecordStoreFunc {
   Fn fn_;
 };
 
+template <class Store, class = void>
+struct IsRecordStoreLike : std::false_type {};
+
 template <class Store>
-concept RecordStoreLike = requires(Store& store, Position pos) {
-  { store.Key(pos) } -> std::same_as<Result<ByteView>>;
-};
+struct IsRecordStoreLike<
+    Store,
+    typename std::enable_if<std::is_same<decltype(std::declval<Store&>().Key(
+                                            std::declval<Position>())),
+                                        Result<ByteView>>::value>::type> : std::true_type {};
 
 template <class V>
 struct HeapRecord {

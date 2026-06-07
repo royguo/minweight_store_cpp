@@ -3,7 +3,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <utility>
 
 #include "minpatricia/byte_view.h"
@@ -144,7 +143,7 @@ struct NodePage {
     return {leaf_base, true};
   }
 
-  Status RouteDiffs(std::span<std::uint16_t> out) const {
+  Status RouteDiffs(Span<std::uint16_t> out) const {
     const int page_size = static_cast<int>(size);
     if (static_cast<int>(out.size()) != page_size - 1) {
       return Status(StatusCode::kCorruptLayout);
@@ -188,8 +187,8 @@ struct NodePage {
 
  private:
   void InsertRouteAt(int route_idx, std::uint16_t diff, std::uint16_t left_count,
-                     std::span<const std::uint16_t> left_ancestors);
-  void DeleteRouteAt(int route_idx, std::span<const std::uint16_t> left_ancestors);
+                     Span<const std::uint16_t> left_ancestors);
+  void DeleteRouteAt(int route_idx, Span<const std::uint16_t> left_ancestors);
 };
 
 static_assert(sizeof(Rep) == 8);
@@ -303,7 +302,7 @@ inline Status NodePage::InsertRoute(int slot, ByteView key, std::uint16_t diff) 
         return Status(StatusCode::kCorruptLayout);
       }
       InsertRouteAt(route_idx, diff, new_left_count,
-                    std::span<const std::uint16_t>(left_ancestors.data(), left_ancestor_count));
+                    Span<const std::uint16_t>(left_ancestors.data(), left_ancestor_count));
       return OkStatus();
     }
 
@@ -326,12 +325,12 @@ inline Status NodePage::InsertRoute(int slot, ByteView key, std::uint16_t diff) 
     return Status(StatusCode::kCorruptLayout);
   }
   InsertRouteAt(route_idx, diff, 1,
-                std::span<const std::uint16_t>(left_ancestors.data(), left_ancestor_count));
+                Span<const std::uint16_t>(left_ancestors.data(), left_ancestor_count));
   return OkStatus();
 }
 
 inline void NodePage::InsertRouteAt(int route_idx, std::uint16_t diff, std::uint16_t left_count,
-                                    std::span<const std::uint16_t> left_ancestors) {
+                                    Span<const std::uint16_t> left_ancestors) {
   const int page_size = static_cast<int>(size);
   for (int i = page_size - 1; i > route_idx; --i) {
     routes[i] = routes[i - 1];
@@ -383,12 +382,12 @@ inline Status NodePage::DeleteRoute(int slot) {
     return Status(StatusCode::kCorruptLayout);
   }
   DeleteRouteAt(parent_route_idx,
-                std::span<const std::uint16_t>(left_ancestors.data(), left_ancestor_count));
+                Span<const std::uint16_t>(left_ancestors.data(), left_ancestor_count));
   return OkStatus();
 }
 
 inline void NodePage::DeleteRouteAt(int route_idx,
-                                    std::span<const std::uint16_t> left_ancestors) {
+                                    Span<const std::uint16_t> left_ancestors) {
   const int page_size = static_cast<int>(size);
   for (int i = route_idx; i < page_size - 2; ++i) {
     routes[i] = routes[i + 1];

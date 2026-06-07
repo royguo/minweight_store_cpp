@@ -8,7 +8,6 @@
 #include <iostream>
 #include <map>
 #include <random>
-#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -275,7 +274,8 @@ void AssertNodeRoutesValid(Records& records, Nodes& nodes, minpatricia::NodePage
   const int size = static_cast<int>(node->size);
   if (size > 1) {
     std::array<std::uint16_t, minpatricia::kMaxNodeReps - 1> got_buf{};
-    auto got = std::span<std::uint16_t>(got_buf.data(), static_cast<std::size_t>(size - 1));
+    auto got =
+        minpatricia::Span<std::uint16_t>(got_buf.data(), static_cast<std::size_t>(size - 1));
     EXPECT_TRUE(node->RouteDiffs(got).ok());
     for (int i = 0; i < size - 1; ++i) {
       const auto want =
@@ -773,7 +773,7 @@ void TestMultiNodeAgainstMap() {
 
   while (expected.size() < 2500) {
     const std::string key = KeyFor(rng(), rng());
-    if (expected.contains(key)) {
+    if (expected.find(key) != expected.end()) {
       continue;
     }
     const auto pos = keys.Add(key);
@@ -826,7 +826,7 @@ void TestIteratorRangeMultiNode() {
 
   while (expected.size() < 2500) {
     const std::string key = KeyFor(rng(), rng(), "range");
-    if (expected.contains(key)) {
+    if (expected.find(key) != expected.end()) {
       continue;
     }
     const auto pos = keys.Add(key);
@@ -917,7 +917,7 @@ void TestCartesianRouteAgainstSortedMap() {
     std::ostringstream out;
     out << "key-" << std::hex << std::setw(8) << std::setfill('0') << rng();
     const std::string key = out.str();
-    if (expected.contains(key)) {
+    if (expected.find(key) != expected.end()) {
       continue;
     }
     const auto pos = keys.Add(key);
@@ -951,7 +951,7 @@ void TestDeleteAllMaintainsRoutes() {
     out << "delete-" << std::hex << std::setw(8) << std::setfill('0') << rng() << "-"
         << std::setw(8) << rng();
     const std::string key = out.str();
-    if (expected.contains(key)) {
+    if (expected.find(key) != expected.end()) {
       continue;
     }
     const auto pos = keys.Add(key);
@@ -1016,7 +1016,7 @@ void TestBoundaryReplaceAndRetarget() {
 
   while (expected.size() < 2500) {
     const std::string key = KeyFor(rng(), rng(), "boundary");
-    if (expected.contains(key)) {
+    if (expected.find(key) != expected.end()) {
       continue;
     }
     const auto pos = records.Add(minpatricia::AsBytes(key), static_cast<int>(expected.size()));

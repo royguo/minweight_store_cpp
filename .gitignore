@@ -4,6 +4,7 @@
 
 # Local build and test output.
 build/
+build-*/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt

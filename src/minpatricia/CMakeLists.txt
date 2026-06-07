@@ -6,7 +6,7 @@ target_include_directories(minpatricia
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-target_compile_features(minpatricia PUBLIC cxx_std_20)
+target_compile_features(minpatricia PUBLIC cxx_std_17)
 
 if(MINWEIGHT_BUILD_TESTS)
   add_executable(minpatricia_tests

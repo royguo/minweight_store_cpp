@@ -2,7 +2,7 @@
 
 ## 目标
 
-把 Go 版 `github.com/JimChengLin/minpatricia` 翻译为当前仓库内的 C++20 `minpatricia` library，并保持它能被外部项目单独使用。
+把 Go 版 `github.com/JimChengLin/minpatricia` 翻译为当前仓库内的 C++17 `minpatricia` library，并保持它能被外部项目单独使用。
 
 源码基线：
 
@@ -16,7 +16,7 @@ commit   2d1ddf70ce818228302912b81220b634218176b4
 
 本模块不做功能降级版或 MVP。实现可以按工程顺序分阶段提交，但 `minpatricia` 的完成标准是一次性补齐 Go 版所有 public API、split/merge/retarget/iterator 行为、model/golden/fuzz 类测试和性能基线。任何为了尽快跑通而替换掉 incremental route insert/delete、split、merge 或 retarget 语义的临时实现，都只能作为本地调试手段，不能进入主线。
 
-性能目标是利用 C++20 把热路径做到接近极限：
+性能目标是在 C++17 约束下把热路径做到接近极限：
 
 - 默认性能路径避免 virtual dispatch。
 - 热路径不发生 heap allocation。
@@ -136,29 +136,21 @@ src/minpatricia/include/minpatricia/
 ```cpp
 using Position = std::uint64_t;
 
-using ByteView = std::span<const std::byte>;
+using ByteView = Span<const std::byte>;
 
 template <class Store>
-concept RecordStoreLike = requires(const Store& store, Position pos) {
-  { store.Key(pos) } -> std::same_as<KeyLookup>;
-};
+struct IsRecordStoreLike;
 
 template <class Store>
-concept NodeStoreLike = requires(Store& store, std::uint64_t id) {
-  { store.Root() } -> std::same_as<std::uint64_t>;
-  { store.Get(id) } -> std::same_as<NodeLookup>;
-  { store.Alloc() } -> std::same_as<NodeAlloc>;
-  { store.Free(id) } -> std::same_as<Status>;
-  { store.LiveNodes() } -> std::convertible_to<std::size_t>;
-};
+struct IsNodeStoreLike;
 
-template <RecordStoreLike RecordStore, NodeStoreLike NodeStore>
+template <class RecordStore, class NodeStore>
 class Index;
 ```
 
-默认 `Index<RecordStore, NodeStore>` 使用 C++20 concepts 约束调用方 store，避免 Go interface 风格在 C++ 中退化为每次 `Get`/`nodeByID` 的 virtual dispatch。若后续确实需要 ABI 稳定或插件式外部 store，可以额外提供 type-erased adapter，但不能作为默认性能路径。
+默认 `Index<RecordStore, NodeStore>` 使用 C++17 templates 静态分发，并通过 traits/static_assert 约束调用方 store，避免 Go interface 风格在 C++ 中退化为每次 `Get`/`nodeByID` 的 virtual dispatch。若后续确实需要 ABI 稳定或插件式外部 store，可以额外提供 type-erased adapter，但不能作为默认性能路径。
 
-`ByteView` 使用 `std::span<const std::byte>` 表达零拷贝 key view。为了调用方便，可以提供从 `std::string_view`、`std::span<const std::uint8_t>` 构造 `ByteView` 的 helper，但 index 内部统一使用 `ByteView`。
+`ByteView` 使用仓库内置 `minpatricia::Span<const std::byte>` 表达零拷贝 key view，避免依赖 C++20 `std::span`。为了调用方便，提供从 `std::string_view`、`Span<const std::uint8_t>` 构造 `ByteView` 的 helper，index 内部统一使用 `ByteView`。
 
 `Status` / `Result<T>` 先在 `minpatricia` 内实现最小错误模型，错误码覆盖：
 
@@ -359,7 +351,7 @@ DeleteHeavyFootprint  10K, 100K             live nodes, node_B/live_key
 - `Get`、`Probe`、`SeekGE`、`SeekLE`、full scan、`PutReplace`、`DeleteHeavy` 热路径不发生 heap allocation。
 - `NodePage` footprint 与 Go 版一致，`node_B/key` 在相同数据集上偏差不超过 5%。
 - C++ benchmark 不慢于 Go 版；若不能快于 Go，需要给出明确 profiling 证据，说明瓶颈来自相同算法本身而不是 C++ 实现开销。
-- 对 `Get`、`Probe`、route lookup、`PutReplace`、`Retarget`、seek hot path 使用 template/concepts 性能路径，默认不引入 virtual call。
+- 对 `Get`、`Probe`、route lookup、`PutReplace`、`Retarget`、seek hot path 使用 template 静态分发性能路径，默认不引入 virtual call。
 - Release benchmark 使用 `-O3 -DNDEBUG`，Debug 结果不作为性能判断。
 - 本地极限 benchmark 可启用 `-march=native`、LTO 和 PGO；通用 release 包保留可移植编译配置。
 
@@ -369,23 +361,22 @@ DeleteHeavyFootprint  10K, 100K             live nodes, node_B/live_key
 - 和 `std::map`、可选 `absl::btree_map` 做对比，但对比项不是 correctness gate。
 - 建立 `.runtime/benchmarks/` 输出目录，保存 Go baseline、C++ baseline 和后续回归结果。
 
-### C++20 优化点
+### C++17 兼容实现点
 
-实现时优先使用以下 C++20 能力：
+当前实现保持 C++17 兼容，同时保留零拷贝和静态分发的性能路径：
 
-- `std::span<const std::byte>` 表达 key view，避免复制。
-- concepts 约束 `RecordStore`/`NodeStore`，让 `Index` 默认走静态分发。
-- `<bit>` 中的 `std::countl_zero` 实现 diff bit 计算。
+- `minpatricia::Span<const std::byte>` 表达 key view，避免复制。
+- C++17 traits/static_assert 约束 `RecordStore`/`NodeStore`，让 `Index` 默认走静态分发。
+- 自实现 8-bit leading-zero helper 计算 diff bit，避免依赖 C++20 `<bit>`。
 - `constexpr` 常量和 helper 锁定 route bit packing、layout byte 计算和 child tag 操作。
 - `std::array` 和固定 stack buffer 承载常见路径，避免小对象 heap 分配。
-- `[[likely]]` / `[[unlikely]]` 只用于 profiling 证明有效的 hot branch。
-- `std::endian` 用于后续 mmap 持久化 layout 的平台检查。
+- 后续 mmap 持久化 layout 的 endian 策略由 `minweight_store` 明确实现，不依赖 C++20 `std::endian`。
 
-## 当前 C++20 实现状态
+## 当前 C++17 实现状态
 
-截至 2026-06-05，`src/minpatricia/` 已落地完整 C++20 核心实现：
+截至 2026-06-07，`src/minpatricia/` 已落地完整 C++17 兼容核心实现：
 
-- `Index<RecordStore, NodeStore>` 使用 concepts/templates，默认热路径静态分发。
+- `Index<RecordStore, NodeStore>` 使用 templates + traits，默认热路径静态分发。
 - public API 覆盖 `NewWithRecords`、`NewWithNodes`、`OpenWithNodes`、`Len`、`Get`、`Probe`、`Put`、`Delete`、`Retarget`、`Visit/Ascend`、所有 Ascend/Descend range/seek 变体、`LiveNodes`。
 - 已移植 Go 版核心算法：diff bit、Cartesian route rebuild、incremental route insert/delete、split/promoteSibling、delete merge、root compression、iterator path、Retarget boundary propagation。
 - `NodePage` 保持 4096 字节，`Rep` 8 字节，`Route` 4 字节，并用 static_assert 锁定 offset。
@@ -411,34 +402,34 @@ DeleteHeavyFootprint  10K, 100K             live nodes, node_B/live_key
 - benchmark 使用 Go-generated fixed fixtures：`bench_keys_1K.tsv`、`bench_keys_10K.tsv`、`bench_keys_100K.tsv`。
 - 当前 golden trace 采用 TSV/line 格式，避免引入 JSON 依赖；fixture 生成脚本保留在 `src/minpatricia/testdata/gen_bench_fixtures.go`。
 
-当前同机轻量性能对照：
+当前同机 C++17 Release 性能对照：
 
 ```text
 Benchmark             Go minpatricia       C++ minpatricia
 --------------------  ------------------   ----------------
-Get/1K                78.23 ns/op          65 ns/op
-Get/10K               134.4 ns/op          119 ns/op
-Get/100K              184.7 ns/op          162 ns/op
-PutReplace/1K         91.46 ns/op          84 ns/op
-PutReplace/10K        146.5 ns/op          136 ns/op
-PutReplace/100K       195.9 ns/op          177 ns/op
-PutInsert/1K          401.9 ns/op          352 ns/op
-PutInsert/10K         568.1 ns/op          492 ns/op
-PutInsert/100K        697.3 ns/op          611 ns/op
+Get/1K                78.23 ns/op          62 ns/op
+Get/10K               134.4 ns/op          117 ns/op
+Get/100K              184.7 ns/op          160 ns/op
+PutReplace/1K         91.46 ns/op          94 ns/op
+PutReplace/10K        146.5 ns/op          143 ns/op
+PutReplace/100K       195.9 ns/op          191 ns/op
+PutInsert/1K          401.9 ns/op          423 ns/op
+PutInsert/10K         568.1 ns/op          579 ns/op
+PutInsert/100K        697.3 ns/op          691 ns/op
 VisitFullSetOrdered/1K 11.105 ns/item      4 ns/item
-VisitFullSetOrdered/10K 11.198 ns/item     4 ns/item
+VisitFullSetOrdered/10K 11.198 ns/item     5 ns/item
 VisitFullSetOrdered/100K 16.570 ns/item    7 ns/item
 VisitFullSetReverse/1K 10.484 ns/item      4 ns/item
-VisitFullSetReverse/10K 10.558 ns/item     4 ns/item
-VisitFullSetReverse/100K 16.049 ns/item    6 ns/item
-Seek/1K               113.2 ns/op          103 ns/op
-Seek/10K              162.2 ns/op          152 ns/op
-Seek/100K             213.4 ns/op          193 ns/op
-ReverseSeek/1K        115.0 ns/op          107 ns/op
-ReverseSeek/10K       164.9 ns/op          157 ns/op
-ReverseSeek/100K      215.4 ns/op          197 ns/op
-DeleteHeavy/10K       126.8 ns/op          110 ns/op
-DeleteHeavy/100K      155.4 ns/op          140 ns/op
+VisitFullSetReverse/10K 10.558 ns/item     5 ns/item
+VisitFullSetReverse/100K 16.049 ns/item    8 ns/item
+Seek/1K               113.2 ns/op          100 ns/op
+Seek/10K              162.2 ns/op          153 ns/op
+Seek/100K             213.4 ns/op          191 ns/op
+ReverseSeek/1K        115.0 ns/op          109 ns/op
+ReverseSeek/10K       164.9 ns/op          156 ns/op
+ReverseSeek/100K      215.4 ns/op          192 ns/op
+DeleteHeavy/10K       126.8 ns/op          122 ns/op
+DeleteHeavy/100K      155.4 ns/op          150 ns/op
 Footprint/1K          16.38 node_B/key     16.384 node_B/key
 Footprint/10K         20.48 node_B/key     20.48 node_B/key
 Footprint/100K        21.09 node_B/key     21.0944 node_B/key

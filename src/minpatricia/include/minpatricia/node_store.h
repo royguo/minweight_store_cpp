@@ -1,9 +1,9 @@
 #pragma once
 
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -18,14 +18,21 @@ struct NodeAlloc {
   NodePage* node = nullptr;
 };
 
+template <class Store, class = void>
+struct IsNodeStoreLike : std::false_type {};
+
 template <class Store>
-concept NodeStoreLike = requires(Store& store, std::uint64_t id) {
-  { store.Root() } -> std::same_as<std::uint64_t>;
-  { store.Get(id) } -> std::same_as<Result<NodePage*>>;
-  { store.Alloc() } -> std::same_as<Result<NodeAlloc>>;
-  { store.Free(id) } -> std::same_as<Status>;
-  { store.LiveNodes() } -> std::same_as<int>;
-};
+struct IsNodeStoreLike<
+    Store,
+    typename std::enable_if<
+        std::is_same<decltype(std::declval<Store&>().Root()), std::uint64_t>::value &&
+        std::is_same<decltype(std::declval<Store&>().Get(std::declval<std::uint64_t>())),
+                     Result<NodePage*>>::value &&
+        std::is_same<decltype(std::declval<Store&>().Alloc()), Result<NodeAlloc>>::value &&
+        std::is_same<decltype(std::declval<Store&>().Free(std::declval<std::uint64_t>())),
+                     Status>::value &&
+        std::is_same<decltype(std::declval<Store&>().LiveNodes()), int>::value>::type>
+    : std::true_type {};
 
 class HeapNodeStore {
  public:

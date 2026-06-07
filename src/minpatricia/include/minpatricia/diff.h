@@ -1,11 +1,9 @@
 #pragma once
 
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <span>
 
 #include "minpatricia/byte_view.h"
 #include "minpatricia/position.h"
@@ -54,6 +52,14 @@ inline int CompareKeys(ByteView a, ByteView b) {
   return 0;
 }
 
+inline unsigned CountLeadingZeroBits8(unsigned value) {
+  unsigned leading = 0;
+  for (unsigned mask = 0x80; (value & mask) == 0; mask >>= 1) {
+    ++leading;
+  }
+  return leading;
+}
+
 inline Result<CompareDiff> CompareAndDiffBit(ByteView a, ByteView b) {
   if (const Status status = CheckKeySize(a); !status.ok()) {
     return status;
@@ -82,8 +88,7 @@ inline Result<CompareDiff> CompareAndDiffBit(ByteView a, ByteView b) {
   const auto ax = std::to_integer<std::uint8_t>(a[i]);
   const auto bx = std::to_integer<std::uint8_t>(b[i]);
   const auto x = static_cast<unsigned>(ax ^ bx);
-  const auto leading = static_cast<unsigned>(
-      std::countl_zero(x) - (std::numeric_limits<unsigned>::digits - 8));
+  const auto leading = CountLeadingZeroBits8(x);
   const auto diff = static_cast<std::uint16_t>(i * 9 + leading + 1);
   if (ax < bx) {
     return CompareDiff{-1, diff};

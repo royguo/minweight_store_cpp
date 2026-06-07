@@ -1,6 +1,6 @@
 # minpatricia
 
-本目录实现仓库内置的 C++ `minpatricia`，并生成可被外部项目单独使用的 `minpatricia` library target。
+本目录实现仓库内置的 C++17 `minpatricia`，并生成可被外部项目单独使用的 `minpatricia` library target。
 
 职责边界：
 
