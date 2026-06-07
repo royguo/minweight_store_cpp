@@ -13,7 +13,7 @@
 产物             状态      用途
 ---------------  --------  ------------------------------------------------------------
 minpatricia      Active    独立 ordered index，可被外部项目单独使用
-minweight_store  WIP       KV store 主库，依赖 minpatricia，目前尚未翻译完成
+minweight_store  WIP       KV store 主库，WAL-backed 主链路已实现，SST/compaction 尚未完成
 ```
 
 ## minpatricia
@@ -104,19 +104,67 @@ auto index = minpatricia::Index<MyRecordStore, MyNodeStore>::NewWithNodes(record
 
 ## minweight_store
 
-`minweight_store` 是 C++ 版 KV store 主库，位于 `src/minweight_store/`。它将依赖并链接 `minpatricia`，用于承载原 Go 版 `minweight_store` 的完整存储引擎能力。
+`minweight_store` 是 C++ 版 KV store 主库，位于 `src/minweight_store/`。它依赖并链接 `minpatricia`，用于承载原 Go 版 `minweight_store` 的完整存储引擎能力。
 
-计划用途和场景：
+当前已经实现：
 
-- public KV API：`Put`、`Get`、`Delete`、`Len`、`SeekGE`、`SeekLE`、`Scan`、`ScanRange`、`ReverseScan`、`ReverseScanRange`。
-- heap-backed in-memory store。
-- WAL、manifest、mmap node store。
-- primary index 与 secondary checkpoint index。
-- flush、recovery、minor compaction、major compaction。
-- SST backend 抽象与具体实现。
-- `Env`/`Runtime` 抽象，用于适配标准线程、bthread/butex、I/O offload 或其他 coroutine/fiber runtime。
+- public KV API：`Open`、`Close`、`Put`、`Get`、`Delete`、`Len`、`SeekGE`、`SeekLE`、`Scan`、`ScanRange`、`ReverseScan`、`ReverseScanRange`。
+- WAL-backed record store，使用 mmap append，默认不在每次写入时主动 `msync`。
+- WAL record CRC 校验、WAL rollover、point-in-time prefix replay 和 strict replay。
+- primary index 使用 `minpatricia`，启动时从 WAL 重建。
+- `Runtime` 抽象与 `StdRuntime`，主链路可以注入不同锁和 blocking I/O 实现，后续可接 bthread/butex runtime。
 
-当前状态：`minweight_store` 尚未从 Go 版本翻译完成，README 中暂不展开实现细节。后续完成 heap-backed in-memory store、WAL、manifest、mmap node store、SST 和 compaction 后再补充 API、使用示例、durability 语义和性能结果。
+当前写入语义是高性能、弱持久化：`Put` / `Delete` 返回表示进程内可见，不代表每次写入已经落盘。crash recovery 默认只接受 WAL 中 CRC-valid 的连续前缀，允许丢失尾部写入，但不跳过中间坏记录恢复后续写入。
+
+尚未完成：
+
+- manifest。
+- mmap node store 与 primary/secondary checkpoint。
+- SST backend。
+- minor compaction 和 major compaction。
+- bthread/butex runtime adapter。
+
+`minweight_store` 的详细设计文档：
+
+```text
+docs/design/minweight_store.md
+```
+
+### 当前性能结果
+
+当前 benchmark 对比的是 WAL-backed 主链路，key/value 生成方式一致，value size 为 64B，Go 版关闭 minor/major compaction 后运行。2026-06-07 同机 Release 结果：
+
+```text
+指标        1K C++ / Go      10K C++ / Go     100K C++ / Go
+----------  ---------------  ---------------  ---------------
+Put         556 / 790 ns     602 / 748 ns     604 / 753 ns
+Get         125 / 206 ns     150 / 233 ns     155 / 226 ns
+Scan        81 / 182 ns      82 / 198 ns      77 / 174 ns
+SeekGE      202 / 319 ns     211 / 316 ns     221 / 348 ns
+```
+
+这组数据不包含 Go 版 SST/compaction 与 C++ 版未来 manifest/checkpoint 的成本，主要用于验证当前主写读链路没有性能回退。
+
+### 使用方式
+
+```cpp
+#include <cassert>
+
+#include "minweight_store/store.h"
+
+void Example() {
+  minweight_store::Options options;
+  auto opened = minweight_store::Store::Open("/path/to/store", options);
+  assert(opened.ok());
+
+  auto store = opened.take_value();
+  assert(store->Put(minweight_store::AsBytes("alice"),
+                    minweight_store::AsBytes("value-1")).ok());
+
+  auto got = store->Get(minweight_store::AsBytes("alice"));
+  assert(got.ok() && got.value().found);
+}
+```
 
 ## 目录
 
@@ -148,6 +196,13 @@ ctest --test-dir build --output-on-failure
 ```bash
 ./build/src/minpatricia/minpatricia_bench
 MINPATRICIA_BENCH_LARGE=1 ./build/src/minpatricia/minpatricia_bench
+```
+
+运行 `minweight_store` benchmark：
+
+```bash
+./build/src/minweight_store/minweight_store_bench
+MINWEIGHT_STORE_BENCH_LARGE=1 ./build/src/minweight_store/minweight_store_bench
 ```
 
 ## 开发规则
